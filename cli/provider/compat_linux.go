@@ -4,6 +4,7 @@ package provider
 
 import (
 	"errors"
+	"os"
 
 	"github.com/moby/moby/pkg/parsers/kernel"
 	"go.uber.org/zap"
@@ -22,6 +23,14 @@ func isCompatible(logger *zap.Logger) error {
 		logger.Error(errMsg)
 		return errors.New(errMsg)
 	}
-	// TODO check for cgroup v2 support
+	// TODO check for cgroup v2  support
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
+		if os.IsNotExist(err) {
+			logger.Error("Cgroup v2 is not supported")
+			return errors.New("cgroup v2 is not supported")
+		}
+	} else {
+		logger.Info("Cgroup v2 is supported")
+	}
 	return nil
 }

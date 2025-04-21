@@ -31,6 +31,11 @@ import (
 
 var Emoji = "\U0001F430" + " Keploy:"
 
+const (
+	initialBufferSize = 32 * 1024       // 32KB initial buffer
+	maxBufferSize     = 5 * 1024 * 1024 // 5MB max buffer
+)
+
 // idCounter is used to generate random ID for each request
 var idCounter int64 = -1
 
@@ -63,32 +68,6 @@ const (
 	Destination Peer = "destination"
 )
 
-func HasCompleteHTTPHeaders(buf []byte) bool {
-
-	// Check for the presence of the end of headers sequence "\r\n\r\n"
-	endOfHeaders := []byte("\r\n\r\n")
-	if len(buf) < len(endOfHeaders) {
-		return false
-	}
-
-	// Check if the buffer contains the end of headers sequence
-	return bytes.Contains(buf, endOfHeaders)
-}
-
-func IsHTTPReq(buf []byte) bool {
-	isHTTP := bytes.HasPrefix(buf[:], []byte("HTTP/")) ||
-		bytes.HasPrefix(buf[:], []byte("GET ")) ||
-		bytes.HasPrefix(buf[:], []byte("POST ")) ||
-		bytes.HasPrefix(buf[:], []byte("PUT ")) ||
-		bytes.HasPrefix(buf[:], []byte("PATCH ")) ||
-		bytes.HasPrefix(buf[:], []byte("DELETE ")) ||
-		bytes.HasPrefix(buf[:], []byte("OPTIONS ")) ||
-		bytes.HasPrefix(buf[:], []byte("HEAD ")) ||
-		bytes.HasPrefix(buf[:], []byte("CONNECT "))
-
-	return isHTTP
-}
-
 // ReadBuffConn is used to read the buffer from the connection
 func ReadBuffConn(ctx context.Context, logger *zap.Logger, conn net.Conn, bufferChannel chan []byte, errChannel chan error) {
 	//TODO: where to close the errChannel
@@ -120,82 +99,25 @@ func ReadBuffConn(ctx context.Context, logger *zap.Logger, conn net.Conn, buffer
 	}
 }
 
-func ReadHTTPHeadersUntilEnd(ctx context.Context, logger *zap.Logger, conn net.Conn) ([]byte, error) {
-	readErr := errors.New("failed to read HTTP headers")
-
-	// Read the incoming data (headers)
-	initialBuf, err := ReadBytes(ctx, logger, conn)
-
-	// Early return if we receive EOF with no data
-	if err == io.EOF && len(initialBuf) == 0 {
-		logger.Debug("received EOF, closing conn", zap.Error(err))
-		return nil, readErr
-	}
-
-	// Handle errors other than EOF
-	if err != nil && err != io.EOF {
-		utils.LogError(logger, err, "failed to read HTTP headers")
-		return nil, readErr
-	}
-
-	// Check if the initial buffer already contains complete headers
-	if HasCompleteHTTPHeaders(initialBuf) {
-		logger.Debug("received complete HTTP headers in initial buffer", zap.Any("size", len(initialBuf)), zap.Any("headers", string(initialBuf)))
-		return initialBuf, nil
-	}
-
-	// If not, continue reading until we find the end of headers
-	var buffer []byte
-	buffer = append(buffer, initialBuf...)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return buffer, ctx.Err()
-		default:
-			// Check if the connection is nil
-			if conn == nil {
-				logger.Debug("the conn is nil")
-				return nil, readErr
-			}
-			// Read more data until we find the header end sequence
-			part, err := ReadBytes(ctx, logger, conn)
-			if err != nil {
-				if err == io.EOF && len(part) == 0 {
-					break // EOF reached, but nothing more to read
-				}
-				utils.LogError(logger, err, "error while reading HTTP headers")
-				return nil, readErr
-			}
-
-			// Append the new data to the buffer
-			buffer = append(buffer, part...)
-
-			// Check if we reached the end of headers
-			if HasCompleteHTTPHeaders(buffer) {
-				logger.Debug("received complete HTTP headers", zap.Any("size", len(buffer)), zap.Any("headers", string(buffer)))
-				return buffer, nil
-			}
-		}
-	}
-}
-
 func ReadInitialBuf(ctx context.Context, logger *zap.Logger, conn net.Conn) ([]byte, error) {
 	readErr := errors.New("failed to read the initial request buffer")
 
 	initialBuf, err := ReadBytes(ctx, logger, conn)
-
-	if err == io.EOF && len(initialBuf) == 0 {
-		logger.Debug("received EOF, closing conn", zap.Error(err))
-		return nil, readErr
-	}
-
 	if err != nil && err != io.EOF {
 		utils.LogError(logger, err, "failed to read the request message in proxy")
 		return nil, readErr
 	}
 
+	if err == io.EOF && len(initialBuf) == 0 {
+		logger.Debug("received EOF, closing conn", zap.Error(err))
+		return nil, readErr
+	}
+
 	logger.Debug("received initial buffer", zap.Any("size", len(initialBuf)), zap.Any("initial buffer", initialBuf))
+	if err != nil {
+		utils.LogError(logger, err, "failed to read the request message in proxy")
+		return nil, readErr
+	}
 	return initialBuf, nil
 }
 
@@ -227,7 +149,8 @@ func ReadBytes(ctx context.Context, logger *zap.Logger, reader io.Reader) ([]byt
 		// Start a goroutine to perform the read operation
 		g.Go(func() error {
 			defer Recover(logger, nil, nil)
-			buf := make([]byte, 1024)
+			// buf := make([]byte, 1024)
+			buf := make([]byte, initialBufferSize)
 			n, err := reader.Read(buf)
 			if ctx.Err() != nil {
 				return nil
@@ -249,7 +172,10 @@ func ReadBytes(ctx context.Context, logger *zap.Logger, reader io.Reader) ([]byt
 				buffer = append(buffer, result.buf[:result.n]...)
 				emptyReads = 0 // Reset the counter because we got some data
 			}
-
+			// Enforce maximum buffer size
+			if len(buffer) > maxBufferSize {
+				return buffer, fmt.Errorf("buffer size exceeded: %d bytes", len(buffer))
+			}
 			if result.err != nil {
 				if result.err == io.EOF {
 					emptyReads++
@@ -261,7 +187,7 @@ func ReadBytes(ctx context.Context, logger *zap.Logger, reader io.Reader) ([]byt
 				}
 				return buffer, result.err
 			}
-			if result.n < len(result.buf) {
+			if result.n < initialBufferSize {
 				return buffer, nil
 			}
 		}
@@ -437,8 +363,6 @@ func PassThrough(ctx context.Context, logger *zap.Logger, clientConn net.Conn, d
 
 		logger.Debug("the iteration for the generic response ends with responses:"+strconv.Itoa(len(buffer)), zap.Any("buffer", buffer))
 	case err := <-errChannel:
-		// Applied this nolint to ignore the staticcheck error here because of readability
-		// nolint:staticcheck
 		if netErr, ok := err.(net.Error); !(ok && netErr.Timeout()) && err != nil {
 			return nil, err
 		}

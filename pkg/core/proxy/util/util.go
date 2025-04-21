@@ -31,6 +31,11 @@ import (
 
 var Emoji = "\U0001F430" + " Keploy:"
 
+const (
+	initialBufferSize = 32 * 1024       // 32KB initial buffer
+	maxBufferSize     = 5 * 1024 * 1024 // 5MB max buffer
+)
+
 // idCounter is used to generate random ID for each request
 var idCounter int64 = -1
 
@@ -144,7 +149,8 @@ func ReadBytes(ctx context.Context, logger *zap.Logger, reader io.Reader) ([]byt
 		// Start a goroutine to perform the read operation
 		g.Go(func() error {
 			defer Recover(logger, nil, nil)
-			buf := make([]byte, 1024)
+			// buf := make([]byte, 1024)
+			buf := make([]byte, initialBufferSize)
 			n, err := reader.Read(buf)
 			if ctx.Err() != nil {
 				return nil
@@ -166,7 +172,10 @@ func ReadBytes(ctx context.Context, logger *zap.Logger, reader io.Reader) ([]byt
 				buffer = append(buffer, result.buf[:result.n]...)
 				emptyReads = 0 // Reset the counter because we got some data
 			}
-
+			// Enforce maximum buffer size
+			if len(buffer) > maxBufferSize {
+				return buffer, fmt.Errorf("buffer size exceeded: %d bytes", len(buffer))
+			}
 			if result.err != nil {
 				if result.err == io.EOF {
 					emptyReads++
@@ -178,7 +187,7 @@ func ReadBytes(ctx context.Context, logger *zap.Logger, reader io.Reader) ([]byt
 				}
 				return buffer, result.err
 			}
-			if result.n < len(result.buf) {
+			if result.n < initialBufferSize {
 				return buffer, nil
 			}
 		}
